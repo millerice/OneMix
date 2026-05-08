@@ -1,0 +1,2 @@
+# Root install: delegates to backend/requirements.txt (ASCII only for GBK pip).
+-r backend/requirements.txt

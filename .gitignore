@@ -1,0 +1,50 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+
+# --- Node / Frontend ---
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/*.tsbuildinfo
+
+# --- Environment / secrets ---
+.env
+.env.*
+!.env.example
+
+# --- Logs / temp ---
+*.log
+*.tmp
+*.temp
+
+# --- OS / editor ---
+.DS_Store
+Thumbs.db
+
+# --- OneMix runtime data ---
+backend/data/*.db
+backend/data/*.db-*
+data/*.db
+data/*.db-*
+
+# --- Private project docs (not open source) ---
+ProjectOverview.md
+
+# --- Local IDE / Cursor config ---
+.cursor/
+
+# --- Local configuration files ---
+*.local
+*.secret
+config.local.*
