@@ -1,13 +1,12 @@
 import { useCallback, useEffect, useState, type DragEvent } from "react";
 import mammoth from "mammoth";
-import { Button, Input, Select, Table } from "antd";
+import { Button, Input, Select, Table, message } from "antd";
 import foldIcon from "../../assets/icons/fold.svg";
 import unfoldIcon from "../../assets/icons/unfold.svg";
 import type {
   SlotRow,
   ServerSettings,
   ExtractResponse,
-  InfoImageItem,
   WhiteImageItem,
   JobResultItem,
   JobState,
@@ -40,8 +39,7 @@ export default function Home() {
   const [nDetailInput, setNDetailInput] = useState("4");
   const [strategy, setStrategy] = useState("doubao_seedream_5");
 
-  const [infoTextFiles, setInfoTextFiles] = useState<File[]>([]);
-  const [infoImages, setInfoImages] = useState<InfoImageItem[]>([]);
+  const [, setInfoTextFiles] = useState<File[]>([]);
   const [mergedText, setMergedText] = useState("");
   interface KeyJson {
     targetAudience?: string[];
@@ -62,9 +60,7 @@ export default function Home() {
   const [detailWhiteImageItems, setDetailWhiteImageItems] = useState<
     WhiteImageItem[]
   >([]);
-  const [detailWhiteViewDescs, setDetailWhiteViewDescs] = useState<string[]>(
-    [],
-  );
+  const [, setDetailWhiteViewDescs] = useState<string[]>([]);
   const [previewImageUrl, setPreviewImageUrl] = useState<string | null>(null);
   const [previewImageName, setPreviewImageName] = useState("");
   const [slots, setSlots] = useState<SlotRow[]>([]);
@@ -119,6 +115,10 @@ export default function Home() {
 
   const appendLog = useCallback((s: string) => {
     setLog((prev) => (prev + s + "\n").slice(-10000));
+    // 如果是错误提示，直接弹出message提示
+    if (s.includes("请先") || s.includes("失败") || s.includes("错误")) {
+      message.warning(s);
+    }
   }, []);
 
   const isDigitsOnly = (value: string) => /^\d+$/.test(value);
@@ -129,13 +129,7 @@ export default function Home() {
       if (!r.ok) throw new Error(await r.text());
       const j = (await r.json()) as ServerSettings;
       setServerSettings(j);
-      const hasDashscope = j.has_dashscope_key === true;
-      const hasArk = j.has_ark_key === true;
-      if (!hasDashscope) {
-        setEditingKey("dashscope");
-      } else if (!hasArk) {
-        setEditingKey("ark");
-      }
+      // 不再自动打开编辑状态，让用户手动点击添加
     } catch (err) {
       console.error("Failed to load server settings:", err);
       setServerSettings(null);
@@ -147,20 +141,11 @@ export default function Home() {
   }, [loadServerSettings]);
 
   useEffect(() => {
-    if (showSettings && serverSettings) {
-      const hasDashscope = serverSettings.has_dashscope_key === true;
-      const hasArk = serverSettings.has_ark_key === true;
-      if (!hasDashscope && editingKey !== "dashscope") {
-        setEditingKey("dashscope");
-      } else if (hasDashscope && !hasArk && editingKey !== "ark") {
-        setEditingKey("ark");
-      }
-    }
+    // 不再自动打开编辑状态，让用户手动点击添加
   }, [showSettings, serverSettings, editingKey]);
 
   useEffect(() => {
     return () => {
-      infoImages.forEach((it) => URL.revokeObjectURL(it.url));
       whiteImageItems.forEach((it) => URL.revokeObjectURL(it.url));
       detailWhiteImageItems.forEach((it) => URL.revokeObjectURL(it.url));
       ocrImageItems.forEach((it) => URL.revokeObjectURL(it.url));
@@ -205,26 +190,6 @@ export default function Home() {
       );
       appendLog(`已导入 ${blocks.length} 个文本文件到合并文本。`);
     }
-  };
-
-  const onAddImageFiles = (fileList: FileList | null) => {
-    if (!fileList || fileList.length === 0) return;
-    const files = Array.from(fileList);
-    const newItems = files.map((f) => ({
-      file: f,
-      url: URL.createObjectURL(f),
-    }));
-    setInfoImages((prev) => [...prev, ...newItems]);
-  };
-
-  const onRemoveImage = (index: number) => {
-    setInfoImages((prev) => {
-      const next = [...prev];
-      const item = next[index];
-      if (item) URL.revokeObjectURL(item.url);
-      next.splice(index, 1);
-      return next;
-    });
   };
 
   const onSelectWhiteFiles = (fileList: FileList | null) => {
@@ -313,11 +278,7 @@ export default function Home() {
   }, []);
 
   const addGeneratedImageToWhites = useCallback(
-    async (
-      target: "main" | "detail",
-      imageUrl: string,
-      imageName: string,
-    ) => {
+    async (target: "main" | "detail", imageUrl: string, imageName: string) => {
       const existingFiles = target === "main" ? whiteFiles : detailWhiteFiles;
       const isDuplicate = (file: File) =>
         existingFiles.some(
@@ -460,53 +421,19 @@ export default function Home() {
     [appendLog, headers, whiteFiles, detailWhiteFiles],
   );
 
-  const updateWhiteViewDesc = (index: number, value: string) => {
-    setWhiteViewDescs((prev) => {
-      const next = [...prev];
-      next[index] = value;
-      return next;
-    });
-  };
-
-  const onOcrImagesToMergedText = async () => {
-    if (!infoImages.length) {
-      appendLog("请先上传商品图片。");
-      return;
-    }
-    setBusy(true);
-    try {
-      const chunks: string[] = [];
-      for (const item of infoImages) {
-        const fd = new FormData();
-        fd.append("image", item.file);
-        const r = await fetch("/api/ocr", {
-          method: "POST",
-          headers,
-          body: fd,
-        });
-        if (!r.ok) throw new Error(await r.text());
-        const j = (await r.json()) as { text: string };
-        const text = (j.text || "").trim();
-        if (text) {
-          chunks.push(`## 图片OCR: ${item.file.name}\n${text}`);
-        }
-      }
-      if (chunks.length > 0) {
-        setMergedText((prev) =>
-          [prev.trim(), ...chunks].filter(Boolean).join("\n\n"),
-        );
-      }
-      appendLog(`OCR 完成，已追加 ${chunks.length} 张图片内容到合并文本。`);
-    } catch (e) {
-      appendLog(`OCR 失败：${e}`);
-    } finally {
-      setBusy(false);
-    }
-  };
-
   const onExtractKeyInfo = async () => {
     if (!mergedText.trim()) {
       appendLog("请先补全「合并文本（可编辑）」，再提取关键信息。");
+      return;
+    }
+    if (!serverSettings) {
+      appendLog("正在加载服务器设置，请稍候...");
+      return;
+    }
+    if (!serverSettings.has_dashscope_key && !serverSettings.has_ark_key) {
+      appendLog(
+        "请先在右上角设置中配置API Key（阿里百炼或即梦ARK），再提取关键信息。",
+      );
       return;
     }
     setBusy(true);
@@ -1494,37 +1421,37 @@ export default function Home() {
         <section className="card">
           <div className="section-header">
             <h2>商品描述文本</h2>
-            <div className="btn-group">
-              <Button
-                className="btn secondary"
-                htmlType="button"
-                onClick={() => {
-                  const input = document.createElement("input");
-                  input.type = "file";
-                  input.multiple = true;
-                  input.accept = ".txt,.md,.csv,.json,.log,.docx";
-                  input.onchange = (e) =>
-                    void onAddTextFiles((e.target as HTMLInputElement).files);
-                  input.click();
-                }}
-              >
-                📁 上传文件
-              </Button>
-              <Button
-                className="btn secondary"
-                htmlType="button"
-                onClick={() => setShowOcrModal(true)}
-              >
-                🖼️ OCR识别
-              </Button>
-              <Button
-                className="btn secondary"
-                htmlType="button"
-                onClick={() => setMergedText("")}
-              >
-                🗑️ 清空
-              </Button>
-            </div>
+          </div>
+          <div className="btn-group" style={{ marginBottom: "16px" }}>
+            <Button
+              className="btn secondary"
+              htmlType="button"
+              onClick={() => {
+                const input = document.createElement("input");
+                input.type = "file";
+                input.multiple = true;
+                input.accept = ".txt,.md,.csv,.json,.log,.docx";
+                input.onchange = (e) =>
+                  void onAddTextFiles((e.target as HTMLInputElement).files);
+                input.click();
+              }}
+            >
+              📁 上传文件
+            </Button>
+            <Button
+              className="btn secondary"
+              htmlType="button"
+              onClick={() => setShowOcrModal(true)}
+            >
+              🖼️ OCR识别
+            </Button>
+            <Button
+              className="btn secondary"
+              htmlType="button"
+              onClick={() => setMergedText("")}
+            >
+              🗑️ 清空
+            </Button>
           </div>
           <label className="label">
             <TextArea
@@ -2016,7 +1943,10 @@ export default function Home() {
                                 key: "actions",
                                 width: 220,
                                 render: (_, s) => (
-                                  <div className="btn-row" style={{ marginTop: 0 }}>
+                                  <div
+                                    className="btn-row"
+                                    style={{ marginTop: 0 }}
+                                  >
                                     <Button
                                       className="btn ghost"
                                       htmlType="button"
@@ -2506,7 +2436,10 @@ export default function Home() {
                                 key: "actions",
                                 width: 220,
                                 render: (_, s) => (
-                                  <div className="btn-row" style={{ marginTop: 0 }}>
+                                  <div
+                                    className="btn-row"
+                                    style={{ marginTop: 0 }}
+                                  >
                                     <Button
                                       className="btn ghost"
                                       htmlType="button"
@@ -2526,7 +2459,9 @@ export default function Home() {
                                           !whiteFiles.length)
                                       }
                                       onClick={() =>
-                                        void onGenerate("detail", [s.list_index])
+                                        void onGenerate("detail", [
+                                          s.list_index,
+                                        ])
                                       }
                                     >
                                       生图
@@ -2543,7 +2478,8 @@ export default function Home() {
                             htmlType="button"
                             disabled={
                               busy ||
-                              (!detailWhiteFiles.length && !whiteFiles.length) ||
+                              (!detailWhiteFiles.length &&
+                                !whiteFiles.length) ||
                               !detailSlots.length
                             }
                             onClick={() => void onGenerate("detail")}
@@ -2602,7 +2538,9 @@ export default function Home() {
                                       }}
                                       onClick={() => {
                                         setPreviewImageUrl(imageUrl);
-                                        setPreviewImageName(`详情图_${s.index}`);
+                                        setPreviewImageName(
+                                          `详情图_${s.index}`,
+                                        );
                                       }}
                                     >
                                       <img
@@ -2908,7 +2846,9 @@ export default function Home() {
                       selectedImageIndices.map(async (index) => {
                         const selected = generatedMainItems[index];
                         if (!selected) return null;
-                        const resp = await fetch(selected.imageUrl, { headers });
+                        const resp = await fetch(selected.imageUrl, {
+                          headers,
+                        });
                         if (!resp.ok) throw new Error(await resp.text());
                         const blob = await resp.blob();
                         const ext = blob.type.includes("png") ? "png" : "jpg";
@@ -2923,7 +2863,9 @@ export default function Home() {
                         };
                       }),
                     );
-                    const newItems = fetchedItems.filter(Boolean) as WhiteImageItem[];
+                    const newItems = fetchedItems.filter(
+                      Boolean,
+                    ) as WhiteImageItem[];
 
                     setDetailWhiteFiles((prev) => [
                       ...prev,

@@ -1,0 +1,39 @@
+# OneMix：前端 Nginx + 后端 FastAPI（Compose 编排）
+# 使用：先在 frontend 目录执行 npm ci && npm run build 生成 dist，再在项目根目录执行：
+#   docker compose up --build -d
+# 浏览器访问：http://localhost:5173
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: api
+      args:
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
+    environment:
+      ONEMIX_DATA_DIR: /data/onemix
+      HOME: /data
+      DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY:-}
+      ARK_API_KEY: ${ARK_API_KEY:-}
+    volumes:
+      - onemix_data:/data/onemix
+      - onemix_cache:/data/.cache
+    expose:
+      - "8767"
+    restart: unless-stopped
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: web
+    ports:
+      - "${ONEMIX_WEB_PORT:-5173}:5173"
+    depends_on:
+      - api
+    restart: unless-stopped
+
+volumes:
+  onemix_data:
+  onemix_cache:
