@@ -22,6 +22,9 @@ class ModelProvider(Protocol):
         n_main: int,
         n_detail: int,
         strategy: str,
+        custom_template: str = "",
+        user_requirements: str = "",
+        ref_image_paths: list[Path] | None = None,
     ) -> list[tuple[str, int, str]]: ...
 
     def plan_single_slot_prompt(
@@ -35,4 +38,6 @@ class ModelProvider(Protocol):
         index: int,
         strategy: str,
         old_prompt: str,
+        ref_image_paths: list[Path] | None = None,
+        primary_ref_index: int | None = None,
     ) -> str: ...

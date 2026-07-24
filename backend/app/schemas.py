@@ -16,6 +16,14 @@ class SlotJobIn(BaseModel):
         default=None,
         description="白底图序号（从 0 起）；为空时按主窗口规则自动选。",
     )
+    aspect_ratio: Optional[str] = Field(
+        default="1:1",
+        description="宽高比（须为当前模型官方推荐表中的值）。",
+    )
+    resolution: Optional[str] = Field(
+        default="2K",
+        description="分辨率档位：依模型而定（如 Seedream 的 2K/3K，或千问的 rec=官方推荐）。",
+    )
 
 
 class PlanSlotsBody(BaseModel):
@@ -46,17 +54,23 @@ class PlanSingleBody(BaseModel):
     index: int
     strategy: str = "background_v2"
     old_prompt: str = ""
+    ref_white_index: Optional[int] = Field(
+        default=None,
+        description="本槽主参考白底图下标（对应 whites 列表，从 0 起）。",
+    )
 
 
 class CreateJobBody(BaseModel):
     slot_jobs: list[SlotJobIn]
-    dw: int = 750
-    dh: int = 1200
     fmt: str = "JPG"
     strategy: str = "background_v2"
     only_indices: Optional[list[int]] = None
     skip_done: bool = True
-
+    # 兼容旧客户端字段（已忽略：详情图不再按 750 规格后处理）
+    dw: Optional[int] = None
+    dh: Optional[int] = None
+    detail_platform: Optional[str] = None
+    detail_max_kb: Optional[int] = None
 
 class JobStatusOut(BaseModel):
     id: str
@@ -91,6 +105,34 @@ class SettingsOut(BaseModel):
     ark_key_updated_at: Optional[str] = Field(
         default=None, description="ISO8601 时间（UTC 存库为 naive 时按本地展示）"
     )
+
+
+class ArkSeedreamModelOut(BaseModel):
+    strategy: str
+    label: str
+    model_id: str
+    owned: bool = True
+    status: str = Field(
+        default="open",
+        description="open=已开通推理 / closed=未开通 / unknown=无法判断",
+    )
+
+
+class ArkSeedreamModelsOut(BaseModel):
+    models: list[ArkSeedreamModelOut]
+    source: str = "ark:/v3/models"
+
+
+class DashScopeQwenImageModelOut(BaseModel):
+    strategy: str
+    label: str
+    model_id: str
+    owned: bool = True
+
+
+class DashScopeQwenImageModelsOut(BaseModel):
+    models: list[DashScopeQwenImageModelOut]
+    source: str = "dashscope:/api/v1/models"
 
 
 class ExtractInfoOut(BaseModel):

@@ -19,9 +19,7 @@ def run_slot_batch_gen(
     ref_whites: list[Path],
     export_session: Path,
     slot_jobs: list[dict],
-    dw: int,
-    dh: int,
-    fmt: str,
+    fmt: str = "JPG",
     strategy: str,
     only_indices: Optional[list[int]] = None,
     skip_done: bool = True,
@@ -30,9 +28,12 @@ def run_slot_batch_gen(
     """
     执行批量槽位生图，返回 [{"list_index": int, "export_path": str}, ...]。
     progress_cb 可选，签名为 (done_count: int) -> None。
+    详情图按模型 size 原样导出 JPG，不做 750 规格后处理。
     """
     if not ref_whites:
         raise RuntimeError("缺少白底商品图，无法出图。")
+
+    _ = fmt  # 保留参数兼容；当前主图/详情均导出 JPG
 
     main_dir = export_session / "主图"
     det_dir = export_session / "详情"
@@ -71,9 +72,24 @@ def run_slot_batch_gen(
             idx = job["index"]
             prompt = job["prompt"]
             slot_ref_path = str(job.get("ref_image_path") or "").strip()
+            slot_resolution = str(job.get("resolution") or "2K").strip() or "2K"
+            # 详情默认竖图 9:16；主图默认 1:1
+            default_aspect = "9:16" if kind == "detail" else "1:1"
+            slot_aspect = str(job.get("aspect_ratio") or default_aspect).strip() or default_aspect
+            model_size = dashscope_svc.resolve_generation_size_for_strategy(
+                strategy,
+                resolution=slot_resolution,
+                aspect_ratio=slot_aspect,
+            )
+            # mixed_auto 下按 kind 切换策略时，重新解析 size
             eff_strategy = strategy
             if strategy == "mixed_auto":
                 eff_strategy = "t2i_turbo" if kind == "main" else "background_v2"
+                model_size = dashscope_svc.resolve_generation_size_for_strategy(
+                    eff_strategy,
+                    resolution=slot_resolution,
+                    aspect_ratio=slot_aspect,
+                )
             if eff_strategy == "background_v2":
                 if slot_ref_path:
                     p = Path(slot_ref_path)
@@ -147,6 +163,7 @@ def run_slot_batch_gen(
                     url = dashscope_svc.text_to_image_first_url(
                         api_key=dashscope_api_key or "",
                         prompt=fallback_prompt,
+                        size=model_size,
                     )
             elif eff_strategy == "t2i_turbo":
                 if not dashscope_api_key:
@@ -160,8 +177,9 @@ def run_slot_batch_gen(
                 url = dashscope_svc.text_to_image_first_url(
                     api_key=dashscope_api_key,
                     prompt=model_prompt,
+                    size=model_size,
                 )
-            elif eff_strategy == "doubao_seedream_5":
+            elif dashscope_svc.is_doubao_strategy(eff_strategy):
                 if not ark_api_key:
                     raise RuntimeError("当前策略需要 ARK API Key")
                 if slot_ref_path:
@@ -174,6 +192,23 @@ def run_slot_batch_gen(
                     api_key=ark_api_key,
                     prompt=prompt,
                     image=image_data_url,
+                    model=dashscope_svc.resolve_doubao_model(eff_strategy),
+                    size=model_size,
+                )
+            elif dashscope_svc.is_qwen_image_strategy(eff_strategy):
+                if not dashscope_api_key:
+                    raise RuntimeError("当前策略需要 DashScope API Key")
+                if slot_ref_path:
+                    p = Path(slot_ref_path)
+                    use_white = p.resolve() if p.is_file() else ref_whites[(idx - 1) % len(ref_whites)]
+                else:
+                    use_white = ref_whites[(idx - 1) % len(ref_whites)]
+                url = dashscope_svc.qwen_family_generate_first_url(
+                    api_key=dashscope_api_key,
+                    strategy=eff_strategy,
+                    prompt=prompt,
+                    image_path=use_white,
+                    size=model_size,
                 )
             else:
                 raise RuntimeError(f"未知生成策略: {eff_strategy}")
@@ -188,25 +223,10 @@ def run_slot_batch_gen(
                 )
                 results.append({"list_index": li, "export_path": str(out)})
             else:
+                out = det_dir / f"detail_{idx:02d}.jpg"
                 dashscope_svc.download_image(url, raw)
-                detail_tmp = td_path / f"detail_{idx:02d}_resized.jpg"
-                target_h = min(int(dh), dashscope_svc.TAOBAO_DETAIL_HARD_MAX_HEIGHT)
-                dashscope_svc.postprocess_to_size(
-                    raw,
-                    detail_tmp,
-                    dashscope_svc.TAOBAO_DETAIL_RECOMMENDED_WIDTH,
-                    target_h,
-                    fmt="JPG",
-                )
-                parts = dashscope_svc.split_detail_image_if_needed(
-                    detail_tmp,
-                    det_dir,
-                    width=dashscope_svc.TAOBAO_DETAIL_RECOMMENDED_WIDTH,
-                    max_height=dashscope_svc.TAOBAO_DETAIL_RECOMMENDED_MAX_HEIGHT,
-                    base_name=f"detail_{idx:02d}",
-                )
-                if parts:
-                    results.append({"list_index": li, "export_path": str(parts[0])})
+                dashscope_svc.export_image_as_jpg(raw, out)
+                results.append({"list_index": li, "export_path": str(out)})
             done += 1
             if progress_cb:
                 progress_cb(done)

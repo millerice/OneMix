@@ -2,12 +2,24 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends
+from typing import Annotated, Optional
+
+from fastapi import APIRouter, Depends, Header, HTTPException
 from sqlalchemy.orm import Session
 
 from app import crud_settings
 from app.database import get_db
-from app.schemas import ArkKeyIn, DashScopeKeyIn, SettingsOut
+from app.deps import get_ark_api_key_optional, get_dashscope_api_key_optional
+from app.schemas import (
+    ArkKeyIn,
+    ArkSeedreamModelOut,
+    ArkSeedreamModelsOut,
+    DashScopeKeyIn,
+    DashScopeQwenImageModelOut,
+    DashScopeQwenImageModelsOut,
+    SettingsOut,
+)
+from onemix.services import dashscope_svc
 
 router = APIRouter(prefix="/settings", tags=["settings"])
 
@@ -67,3 +79,50 @@ def save_ark_key(body: ArkKeyIn, db: Session = Depends(get_db)) -> dict[str, boo
 def clear_ark_key(db: Session = Depends(get_db)) -> dict[str, bool]:
     crud_settings.delete_ark_api_key(db)
     return {"ok": True}
+
+
+@router.get("/ark-seedream-models", response_model=ArkSeedreamModelsOut)
+def list_ark_seedream_models(
+    db: Session = Depends(get_db),
+    x_ark_key: Annotated[Optional[str], Header(alias="X-Ark-Key")] = None,
+) -> ArkSeedreamModelsOut:
+    """从方舟 GET /v3/models 同步当前 Key 可用的 Seedream 模型。"""
+    ark_key = get_ark_api_key_optional(db=db, x_ark_key=x_ark_key)
+    if not ark_key:
+        raise HTTPException(
+            401,
+            "缺少 ARK API Key：请先在设置中保存，或通过请求头 X-Ark-Key / 环境变量 ARK_API_KEY 提供。",
+        )
+    try:
+        rows = dashscope_svc.list_ark_seedream_models(api_key=ark_key)
+    except RuntimeError as e:
+        raise HTTPException(502, str(e)) from e
+    return ArkSeedreamModelsOut(
+        models=[ArkSeedreamModelOut(**row) for row in rows],
+        source="ark:/v3/models",
+    )
+
+
+@router.get("/dashscope-qwen-image-models", response_model=DashScopeQwenImageModelsOut)
+def list_dashscope_qwen_image_models(
+    db: Session = Depends(get_db),
+    x_dashscope_key: Annotated[Optional[str], Header(alias="X-DashScope-Key")] = None,
+    authorization: Annotated[Optional[str], Header()] = None,
+) -> DashScopeQwenImageModelsOut:
+    """从百炼 Models.list / Models.get 同步当前 Key 可见的 Qwen-Image 模型。"""
+    ds_key = get_dashscope_api_key_optional(
+        db=db, x_dashscope_key=x_dashscope_key, authorization=authorization
+    )
+    if not ds_key:
+        raise HTTPException(
+            401,
+            "缺少 DashScope API Key：请先在设置中保存，或通过请求头 X-DashScope-Key / Authorization / 环境变量 DASHSCOPE_API_KEY 提供。",
+        )
+    try:
+        rows = dashscope_svc.list_dashscope_qwen_image_models(api_key=ds_key)
+    except RuntimeError as e:
+        raise HTTPException(502, str(e)) from e
+    return DashScopeQwenImageModelsOut(
+        models=[DashScopeQwenImageModelOut(**row) for row in rows],
+        source="dashscope:/api/v1/models",
+    )

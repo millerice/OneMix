@@ -30,6 +30,7 @@ class DashScopeProvider:
         strategy: str,
         custom_template: str = "",
         user_requirements: str = "",
+        ref_image_paths: list[Path] | None = None,
     ) -> list[tuple[str, int, str]]:
         return dashscope_svc.plan_background_prompts_for_slots(
             api_key=api_key,
@@ -41,6 +42,7 @@ class DashScopeProvider:
             strategy=strategy,
             custom_template=custom_template,
             user_requirements=user_requirements,
+            ref_image_paths=ref_image_paths,
         )
 
     def plan_single_slot_prompt(
@@ -54,6 +56,8 @@ class DashScopeProvider:
         index: int,
         strategy: str,
         old_prompt: str,
+        ref_image_paths: list[Path] | None = None,
+        primary_ref_index: int | None = None,
     ) -> str:
         return dashscope_svc.plan_single_slot_prompt(
             api_key=api_key,
@@ -64,4 +68,6 @@ class DashScopeProvider:
             index=index,
             strategy=strategy,
             old_prompt=old_prompt,
+            ref_image_paths=ref_image_paths,
+            primary_ref_index=primary_ref_index,
         )

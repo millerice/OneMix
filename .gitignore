@@ -1,11 +1,21 @@
 # --- Python ---
 __pycache__/
 *.py[cod]
-*.pyo
-*.pyd
+*$py.class
+*.so
+.Python
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+coverage/
+*.egg-info/
+.eggs/
+dist/
+build/
 
 # --- Virtual environments ---
 .venv/
@@ -13,38 +23,50 @@ venv/
 env/
 
 # --- Node / Frontend ---
+node_modules/
 frontend/node_modules/
 frontend/dist/
 frontend/.vite/
-frontend/*.tsbuildinfo
+*.tsbuildinfo
 
 # --- Environment / secrets ---
 .env
 .env.*
 !.env.example
+!.env.docker.example
+*.pem
+*.p12
+*.key
 
 # --- Logs / temp ---
 *.log
 *.tmp
 *.temp
+tmp/
+temp/
 
 # --- OS / editor ---
 .DS_Store
 Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~
 
-# --- OneMix runtime data ---
+# --- OneMix runtime data（SQLite；目录本身用 .gitkeep 保留） ---
 backend/data/*.db
 backend/data/*.db-*
 data/*.db
 data/*.db-*
 
-# --- Private project docs (not open source) ---
+# --- Private project docs（本地规格，不随开源仓库发布） ---
 ProjectOverview.md
+docs/
 
-# --- Local IDE / Cursor config ---
+# --- Local IDE / Cursor ---
 .cursor/
 
-# --- Local configuration files ---
+# --- Local overrides ---
 *.local
 *.secret
 config.local.*

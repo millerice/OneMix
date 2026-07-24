@@ -91,8 +91,6 @@ def _run_job_sync(
             ref_whites=white_paths,
             export_session=export_session,
             slot_jobs=materialized,
-            dw=body.dw,
-            dh=body.dh,
             fmt=body.fmt,
             strategy=body.strategy,
             only_indices=body.only_indices,

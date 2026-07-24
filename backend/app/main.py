@@ -234,26 +234,50 @@ async def api_competitor(
 async def api_plan_slots(
     api_key: Annotated[str, Depends(resolve_api_key)],
     provider: Annotated[DashScopeProvider, Depends(get_provider)],
-    body: PlanSlotsBody,
+    plan: str = Form(...),
+    whites: list[UploadFile] = File(default=[]),
 ) -> dict[str, object]:
+    try:
+        body = PlanSlotsBody.model_validate(json.loads(plan))
+    except (json.JSONDecodeError, ValueError) as e:
+        raise HTTPException(400, f"plan 字段 JSON 无效: {e}") from e
 
-    def work() -> list[tuple[str, int, str]]:
-        return provider.plan_background_prompts_for_slots(
-            api_key=api_key,
-            product_name=body.product_name,
-            product_desc=body.product_desc,
-            competitor_summary=body.competitor_summary,
-            n_main=body.n_main,
-            n_detail=body.n_detail,
-            strategy=body.strategy,
-            custom_template=body.custom_template,
-            user_requirements=body.user_requirements,
-        )
+    tmp_paths: list[Path] = []
+    try:
+        for uf in whites:
+            data = await uf.read()
+            if not data:
+                continue
+            if len(data) > 40 * 1024 * 1024:
+                raise HTTPException(413, "单张白底图过大")
+            suf = Path(uf.filename or "w.png").suffix or ".png"
+            tmp_paths.append(_write_temp_upload(data, suf))
+        if not tmp_paths:
+            raise HTTPException(400, "请至少上传一张白底参考图，以便结合参考图生成提示词")
+        n_whites = max(1, len(tmp_paths))
 
-    rows_raw = await _run_blocking(work)
+        def work() -> list[tuple[str, int, str]]:
+            return provider.plan_background_prompts_for_slots(
+                api_key=api_key,
+                product_name=body.product_name,
+                product_desc=body.product_desc,
+                competitor_summary=body.competitor_summary,
+                n_main=body.n_main,
+                n_detail=body.n_detail,
+                strategy=body.strategy,
+                custom_template=body.custom_template,
+                user_requirements=body.user_requirements,
+                ref_image_paths=tmp_paths,
+            )
+
+        rows_raw = await _run_blocking(work)
+    finally:
+        for p in tmp_paths:
+            _try_unlink(p)
+
     rows: list[PlanSlotsRow] = []
     for li, (kind, idx, prompt) in enumerate(rows_raw):
-        rwi = default_ref_white_index(body.n_white_images, kind, int(idx))
+        rwi = default_ref_white_index(n_whites, kind, int(idx))
         rows.append(
             PlanSlotsRow(
                 list_index=li,
@@ -270,22 +294,46 @@ async def api_plan_slots(
 async def api_plan_single(
     api_key: Annotated[str, Depends(resolve_api_key)],
     provider: Annotated[DashScopeProvider, Depends(get_provider)],
-    body: PlanSingleBody,
+    plan: str = Form(...),
+    whites: list[UploadFile] = File(default=[]),
 ) -> dict[str, str]:
+    try:
+        body = PlanSingleBody.model_validate(json.loads(plan))
+    except (json.JSONDecodeError, ValueError) as e:
+        raise HTTPException(400, f"plan 字段 JSON 无效: {e}") from e
 
-    def work() -> str:
-        return provider.plan_single_slot_prompt(
-            api_key=api_key,
-            product_name=body.product_name,
-            product_desc=body.product_desc,
-            competitor_summary=body.competitor_summary,
-            kind=body.kind,
-            index=body.index,
-            strategy=body.strategy,
-            old_prompt=body.old_prompt,
-        )
+    tmp_paths: list[Path] = []
+    try:
+        for uf in whites:
+            data = await uf.read()
+            if not data:
+                continue
+            if len(data) > 40 * 1024 * 1024:
+                raise HTTPException(413, "单张白底图过大")
+            suf = Path(uf.filename or "w.png").suffix or ".png"
+            tmp_paths.append(_write_temp_upload(data, suf))
+        if not tmp_paths:
+            raise HTTPException(400, "请至少上传一张白底参考图，以便结合参考图重构提示词")
 
-    text = await _run_blocking(work)
+        def work() -> str:
+            return provider.plan_single_slot_prompt(
+                api_key=api_key,
+                product_name=body.product_name,
+                product_desc=body.product_desc,
+                competitor_summary=body.competitor_summary,
+                kind=body.kind,
+                index=body.index,
+                strategy=body.strategy,
+                old_prompt=body.old_prompt,
+                ref_image_paths=tmp_paths,
+                primary_ref_index=body.ref_white_index,
+            )
+
+        text = await _run_blocking(work)
+    finally:
+        for p in tmp_paths:
+            _try_unlink(p)
+
     return {"prompt": text}
 
 
@@ -309,11 +357,17 @@ async def api_create_job(
         db=db, x_dashscope_key=x_dashscope_key, authorization=authorization
     )
     ark_key = get_ark_api_key_optional(db=db, x_ark_key=x_ark_key)
-    if body.strategy == "doubao_seedream_5":
+    if dashscope_svc.strategy_requires_ark(body.strategy):
         if not ark_key:
             raise HTTPException(
                 401,
-                "缺少 ARK API Key：请在前端保存即梦 Key，或通过请求头 X-Ark-Key / 环境变量 ARK_API_KEY 提供。",
+                "缺少 ARK API Key：请在前端保存豆包/即梦 Key，或通过请求头 X-Ark-Key / 环境变量 ARK_API_KEY 提供。",
+            )
+    elif dashscope_svc.strategy_requires_dashscope_for_gen(body.strategy):
+        if not dashscope_key:
+            raise HTTPException(
+                401,
+                "缺少 DashScope API Key：请在前端保存阿里百炼 Key，或通过请求头 X-DashScope-Key / Authorization 提供。",
             )
     elif not dashscope_key:
         raise HTTPException(

@@ -15,15 +15,39 @@ from typing import Any, Optional
 import dashscope
 import requests
 from dashscope import Generation, ImageSynthesis, MultiModalConversation
+from dashscope.aigc.image_generation import ImageGeneration
+from dashscope.api_entities.dashscope_response import Message
 from dashscope.utils.oss_utils import OssUtils
 from onemix.services import prompt_templates as prompts
 
 VL_MODEL_DEFAULT = "qwen-vl-plus"
+# 关键信息提取：轻量快模型
+EXTRACT_TEXT_MODEL = "qwen-flash"
+# 纯文本改写/翻译仍用 qwen-max；提示词规划改为 VL，可结合参考图
 PLANNER_TEXT_MODEL = "qwen-max"
+PLANNER_VL_MODEL = VL_MODEL_DEFAULT
+# 规划时最多送入 VL 的白底参考图张数（控制成本与上下文）
+PLANNER_MAX_REF_IMAGES = 8
 # 万相-图像背景生成（需 RGBA 主体图 + HTTP 异步任务）
 BG_GENERATION_MODEL = "wanx-background-generation-v2"
 T2I_MODEL_DEFAULT = "wanx2.1-t2i-turbo"
 DOUBAO_SEEDREAM_MODEL = "doubao-seedream-5-0-260128"
+DOUBAO_SEEDREAM_MODELS: dict[str, str] = {
+    # 历史别名 → 5.0 lite
+    "doubao_seedream_5": "doubao-seedream-5-0-260128",
+    "doubao_seedream_5_lite": "doubao-seedream-5-0-260128",
+    "doubao_seedream_5_pro": "doubao-seedream-5-0-pro-260628",
+    "doubao_seedream_4_5": "doubao-seedream-4-5-251128",
+    "doubao_seedream_4_0": "doubao-seedream-4-0-250828",
+}
+QWEN_IMAGE_MODELS: dict[str, str] = {
+    "qwen_image_2_0_pro": "qwen-image-2.0-pro",
+    "qwen_image_2_0_pro_2026_06_22": "qwen-image-2.0-pro-2026-06-22",
+    "qwen_image_2_0": "qwen-image-2.0",
+    # 历史策略（前端已下线，保留后端兼容）
+    "qwen_z_image_turbo": "z-image-turbo",
+    "qwen_wan27_image_pro": "wan2.7-image-pro",
+}
 ARK_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
 BG_CREATE_URL = (
     "https://dashscope.aliyuncs.com/api/v1/services/aigc/background-generation/generation/"
@@ -32,13 +56,423 @@ BG_TASK_URL = "https://dashscope.aliyuncs.com/api/v1/tasks/{task_id}"
 CN_STRONG_IMAGE_MODELS = {BG_GENERATION_MODEL, T2I_MODEL_DEFAULT}
 logger = logging.getLogger(__name__)
 
+
+def seedream_supports_image_to_image(model_id: str) -> bool:
+    """是否支持图生图（image 参考图）。纯 T2I / Seedream 3.x 等排除。"""
+    mid = (model_id or "").lower()
+    if "seedream" not in mid:
+        return False
+    if "-t2i" in mid or "_t2i" in mid or ".t2i" in mid:
+        return False
+    if "seedream-3" in mid or "seedream_3" in mid:
+        return False
+    return (
+        "seedream-4" in mid
+        or "seedream_4" in mid
+        or "seedream-5" in mid
+        or "seedream_5" in mid
+    )
+
+
+def qwen_family_supports_image_to_image(model_id: str) -> bool:
+    """千问/万相侧是否支持图生图或图像编辑入参。"""
+    mid = (model_id or "").lower()
+    if mid.startswith("qwen-image"):
+        return True
+    if mid.startswith("wan") and "t2i" not in mid:
+        return True
+    return False
+
+
+def is_doubao_strategy(strategy: str) -> bool:
+    if strategy in DOUBAO_SEEDREAM_MODELS:
+        return True
+    # 同步自 ARK /models 的动态策略：ark:<model_id>（仅图生图）
+    if strategy.startswith("ark:"):
+        mid = strategy[4:].strip()
+        return seedream_supports_image_to_image(mid)
+    return False
+
+
+def is_qwen_image_strategy(strategy: str) -> bool:
+    if strategy in QWEN_IMAGE_MODELS:
+        return True
+    if strategy.startswith("ds:"):
+        mid = strategy[3:].strip()
+        return qwen_family_supports_image_to_image(mid)
+    return False
+
+
+def resolve_doubao_model(strategy: str) -> str:
+    if strategy.startswith("ark:"):
+        mid = strategy[4:].strip()
+        if not mid:
+            raise RuntimeError("动态豆包策略缺少 model id")
+        return mid
+    return DOUBAO_SEEDREAM_MODELS.get(strategy) or DOUBAO_SEEDREAM_MODEL
+
+
+def resolve_qwen_image_model(strategy: str) -> str:
+    if strategy.startswith("ds:"):
+        mid = strategy[3:].strip()
+        if not mid:
+            raise RuntimeError("动态千问策略缺少 model id")
+        return mid
+    mid = QWEN_IMAGE_MODELS.get(strategy)
+    if not mid:
+        raise RuntimeError(f"未知千问生图策略: {strategy}")
+    return mid
+
+
+def strategy_requires_ark(strategy: str) -> bool:
+    return is_doubao_strategy(strategy)
+
+
+def strategy_requires_dashscope_for_gen(strategy: str) -> bool:
+    """生图阶段是否需要 DashScope Key（规划阶段通常仍需要）。"""
+    return strategy in ("background_v2", "mixed_auto", "t2i_turbo") or is_qwen_image_strategy(
+        strategy
+    )
+
+
+# model_id → 精选策略值（不含历史别名，避免一对多冲突）
+_DOUBAO_MODEL_TO_STRATEGY: dict[str, str] = {
+    "doubao-seedream-5-0-260128": "doubao_seedream_5_lite",
+    "doubao-seedream-5-0-pro-260628": "doubao_seedream_5_pro",
+    "doubao-seedream-4-5-251128": "doubao_seedream_4_5",
+    "doubao-seedream-4-0-250828": "doubao_seedream_4_0",
+}
+
+_DOUBAO_STRATEGY_LABELS: dict[str, str] = {
+    "doubao_seedream_5_lite": "Doubao Seedream 5.0 lite",
+    "doubao_seedream_5_pro": "Doubao Seedream 5.0 pro",
+    "doubao_seedream_4_5": "Doubao Seedream 4.5",
+    "doubao_seedream_4_0": "Doubao Seedream 4.0",
+}
+
+
+def _seedream_display_label(model_id: str, strategy: str) -> str:
+    if strategy in _DOUBAO_STRATEGY_LABELS:
+        return _DOUBAO_STRATEGY_LABELS[strategy]
+    s = model_id
+    if s.startswith("doubao-"):
+        s = s[len("doubao-") :]
+    parts = s.split("-")
+    if parts and parts[-1].isdigit() and len(parts[-1]) >= 6:
+        parts = parts[:-1]
+    merged: list[str] = []
+    i = 0
+    while i < len(parts):
+        # 5-0 → 5.0
+        if (
+            i + 1 < len(parts)
+            and parts[i].isdigit()
+            and parts[i + 1].isdigit()
+            and len(parts[i]) <= 2
+            and len(parts[i + 1]) <= 2
+        ):
+            merged.append(f"{parts[i]}.{parts[i + 1]}")
+            i += 2
+            continue
+        p = parts[i]
+        if p.lower() in ("pro", "lite"):
+            merged.append(p.lower())
+        elif p.isdigit():
+            merged.append(p)
+        else:
+            merged.append(p.capitalize())
+        i += 1
+    label = " ".join(merged).strip()
+    return f"Doubao {label}" if label else model_id
+
+
+def _ark_error_code(resp_text: str, status_code: int) -> str:
+    try:
+        j = json.loads(resp_text or "{}")
+        err = j.get("error") if isinstance(j, dict) else None
+        if isinstance(err, dict):
+            return str(err.get("code") or "").strip()
+    except Exception:
+        pass
+    if "ModelNotOpen" in (resp_text or ""):
+        return "ModelNotOpen"
+    return ""
+
+
+def _ark_seedream_inference_open(*, api_key: str, model_id: str) -> bool | None:
+    """
+    用不合法 size 探测模型是否已开通推理，避免真实出图计费。
+
+    Returns:
+        True  — 已开通（请求到达参数校验）
+        False — 未开通（ModelNotOpen 等）
+        None  — 无法判断（鉴权失败、网络错误等）
+    """
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+    }
+    payload: dict[str, Any] = {
+        "model": model_id,
+        "prompt": "probe",
+        # 故意非法，期望 InvalidParameter；若未开通会先返回 ModelNotOpen
+        "size": "__onemix_probe__",
+        "response_format": "url",
+        "stream": False,
+        "watermark": True,
+    }
+    try:
+        r = requests.post(
+            f"{ARK_BASE_URL}/images/generations",
+            headers=headers,
+            data=json.dumps(payload),
+            timeout=20,
+        )
+    except requests.RequestException as e:
+        logger.warning("ARK probe network error model=%s: %s", model_id, e)
+        return None
+
+    code = _ark_error_code(r.text, r.status_code)
+    text = r.text or ""
+    if (
+        code == "ModelNotOpen"
+        or "ModelNotOpen" in text
+        or "has not activated the model" in text
+    ):
+        return False
+    if r.status_code == 200:
+        return True
+    if code in ("InvalidParameter", "MissingParameter", "InvalidArgument"):
+        return True
+    if r.status_code == 400:
+        # 其它 400 通常也说明请求已打到模型侧参数校验
+        return True
+    if r.status_code in (401, 403):
+        return None
+    if r.status_code == 404:
+        return False
+    logger.info(
+        "ARK probe inconclusive model=%s status=%s code=%s body=%s",
+        model_id,
+        r.status_code,
+        code,
+        text[:200],
+    )
+    return None
+
+
+def list_ark_seedream_models(*, api_key: str) -> list[dict[str, Any]]:
+    """
+    列出 Seedream 候选并探测真实开通状态。
+
+    1) GET /api/v3/models 过滤 seedream
+    2) 并入精选目录 model id
+    3) 对每个 id 做免出图开通探测（并行）
+
+    返回 [{strategy, label, model_id, owned, status}]
+    status: open | closed | unknown
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    r = requests.get(f"{ARK_BASE_URL}/models", headers=headers, timeout=30)
+    if r.status_code != 200:
+        raise RuntimeError(f"拉取 ARK 模型列表失败: HTTP {r.status_code} {r.text[:500]}")
+    j = r.json()
+    raw = j.get("data") if isinstance(j, dict) else None
+    if not isinstance(raw, list):
+        raise RuntimeError(f"ARK 模型列表格式异常: {j}")
+
+    listed: list[str] = []
+    seen: set[str] = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        mid = str(item.get("id") or "").strip()
+        if not mid or not seedream_supports_image_to_image(mid):
+            continue
+        if mid in seen:
+            continue
+        seen.add(mid)
+        listed.append(mid)
+
+    # 精选目录优先，再追加列表中的其它 Seedream
+    ordered: list[str] = []
+    for mid in _DOUBAO_MODEL_TO_STRATEGY:
+        if mid not in ordered:
+            ordered.append(mid)
+    for mid in listed:
+        if mid not in ordered:
+            ordered.append(mid)
+
+    opened_map: dict[str, bool | None] = {}
+    workers = min(6, max(1, len(ordered)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futs = {
+            pool.submit(_ark_seedream_inference_open, api_key=api_key, model_id=mid): mid
+            for mid in ordered
+        }
+        for fut in as_completed(futs):
+            mid = futs[fut]
+            try:
+                opened_map[mid] = fut.result()
+            except Exception as e:
+                logger.warning("ARK probe failed model=%s: %s", mid, e)
+                opened_map[mid] = None
+
+    out: list[dict[str, Any]] = []
+    for mid in ordered:
+        opened = opened_map.get(mid)
+        if opened is True:
+            status, owned = "open", True
+        elif opened is False:
+            status, owned = "closed", False
+        else:
+            status, owned = "unknown", False
+        strategy = _DOUBAO_MODEL_TO_STRATEGY.get(mid) or f"ark:{mid}"
+        out.append(
+            {
+                "strategy": strategy,
+                "label": _seedream_display_label(mid, strategy),
+                "model_id": mid,
+                "owned": owned,
+                "status": status,
+            }
+        )
+
+    rank = {s: i for i, s in enumerate(_DOUBAO_STRATEGY_LABELS)}
+    out.sort(key=lambda x: (rank.get(x["strategy"], 1000), x["model_id"]))
+    return out
+
+
+# model_id → 精选策略值（前端千问目录）
+_QWEN_MODEL_TO_STRATEGY: dict[str, str] = {
+    "qwen-image-2.0-pro": "qwen_image_2_0_pro",
+    "qwen-image-2.0-pro-2026-06-22": "qwen_image_2_0_pro_2026_06_22",
+    "qwen-image-2.0": "qwen_image_2_0",
+}
+
+_QWEN_STRATEGY_LABELS: dict[str, str] = {
+    "qwen_image_2_0_pro": "qwen-image-2.0-pro",
+    "qwen_image_2_0_pro_2026_06_22": "qwen-image-2.0-pro-2026-06-22",
+    "qwen_image_2_0": "qwen-image-2.0",
+}
+
+
+def _qwen_image_display_label(model_id: str, strategy: str) -> str:
+    if strategy in _QWEN_STRATEGY_LABELS:
+        return _QWEN_STRATEGY_LABELS[strategy]
+    return model_id
+
+
+def _extract_dashscope_model_name(item: Any) -> str:
+    if isinstance(item, str):
+        return item.strip()
+    if not isinstance(item, dict):
+        return ""
+    for key in ("model", "name", "id", "model_name"):
+        v = item.get(key)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return ""
+
+
+def _dashscope_models_page(*, api_key: str, page_no: int, page_size: int) -> tuple[list[Any], int | None]:
+    """调用 DashScope GET /api/v1/models 分页。返回 (items, total_or_None)。"""
+    from dashscope.models import Models
+
+    # Models.list 形参名为 page（不是 page_no）；若传 page_no= 会落入 **kwargs，
+    # 再经 super().list(page, page_size, page_no=...) 触发「page_no 重复传参」。
+    resp = Models.list(page=page_no, page_size=page_size, api_key=api_key)
+    status = getattr(resp, "status_code", None)
+    if status != 200:
+        raise RuntimeError(
+            getattr(resp, "message", None) or f"拉取百炼模型列表失败: status={status}"
+        )
+    out = getattr(resp, "output", None)
+    if out is None:
+        return [], 0
+    if isinstance(out, dict):
+        items = out.get("models") or out.get("data") or []
+        total = out.get("total")
+        if not isinstance(items, list):
+            items = []
+        return items, int(total) if isinstance(total, int) else None
+    if isinstance(out, list):
+        return out, None
+    return [], 0
+
+
+def _dashscope_model_exists(*, api_key: str, model_id: str) -> bool:
+    """用 Models.get 探测账号是否可见该模型。"""
+    from dashscope.models import Models
+
+    try:
+        resp = Models.get(name=model_id, api_key=api_key)
+    except Exception:
+        return False
+    status = getattr(resp, "status_code", None)
+    return status == 200 and getattr(resp, "output", None) is not None
+
+
+def list_dashscope_qwen_image_models(*, api_key: str) -> list[dict[str, Any]]:
+    """
+    通过百炼 Models.list（并补充 Models.get 探测精选项）同步 Qwen-Image 系列。
+    返回 [{strategy, label, model_id, owned}]。
+    """
+    seen: set[str] = set()
+    out: list[dict[str, Any]] = []
+
+    def _add(mid: str) -> None:
+        mid = (mid or "").strip()
+        if not mid or not qwen_family_supports_image_to_image(mid):
+            return
+        if mid in seen:
+            return
+        seen.add(mid)
+        strategy = _QWEN_MODEL_TO_STRATEGY.get(mid) or f"ds:{mid}"
+        out.append(
+            {
+                "strategy": strategy,
+                "label": _qwen_image_display_label(mid, strategy),
+                "model_id": mid,
+                "owned": True,
+            }
+        )
+
+    page_no = 1
+    page_size = 100
+    while page_no <= 20:
+        items, total = _dashscope_models_page(
+            api_key=api_key, page_no=page_no, page_size=page_size
+        )
+        if not items:
+            break
+        for item in items:
+            _add(_extract_dashscope_model_name(item))
+        if total is not None and page_no * page_size >= total:
+            break
+        if len(items) < page_size:
+            break
+        page_no += 1
+
+    # 列表接口未必覆盖全部图像模型：对精选目录再做 get 探测
+    for mid in _QWEN_MODEL_TO_STRATEGY:
+        if mid in seen:
+            continue
+        if _dashscope_model_exists(api_key=api_key, model_id=mid):
+            _add(mid)
+
+    rank = {s: i for i, s in enumerate(_QWEN_STRATEGY_LABELS)}
+    out.sort(key=lambda x: (rank.get(x["strategy"], 1000), x["model_id"]))
+    return out
+
+
 TAOBAO_MAIN_RECOMMENDED = (1440, 1440)
 TAOBAO_MAIN_MIN = (800, 800)
-TAOBAO_DETAIL_RECOMMENDED_WIDTH = 750
-TAOBAO_DETAIL_MIN_WIDTH = 620
-TAOBAO_DETAIL_MAX_WIDTH = 1500
-TAOBAO_DETAIL_RECOMMENDED_MAX_HEIGHT = 1500
-TAOBAO_DETAIL_HARD_MAX_HEIGHT = 2000
 
 
 def _set_key(api_key: Optional[str]) -> None:
@@ -136,16 +570,44 @@ def extract_key_info_from_text(*, api_key: str, text: str) -> dict[str, Any]:
     content = (text or "").strip()
     if not content:
         raise RuntimeError("商品文本为空，无法提取关键信息")
+    # 过长文本先截断，降低 flash/turbo 延迟与超时风险（约 12k 汉字量级）
+    max_chars = 12000
+    if len(content) > max_chars:
+        content = content[:max_chars] + "\n\n【系统】文本过长，已截断后提取。"
     prompt = prompts.build_key_info_extraction_prompt(content)
-    raw = _generation_text(api_key=api_key, prompt=prompt, model=PLANNER_TEXT_MODEL)
+    raw = _generation_text(
+        api_key=api_key,
+        prompt=prompt,
+        model=EXTRACT_TEXT_MODEL,
+        json_object=True,
+    )
     return _extract_json_object(raw)
 
 
-def _generation_text(*, api_key: str, prompt: str, model: str = PLANNER_TEXT_MODEL) -> str:
+def _generation_text(
+    *,
+    api_key: str,
+    prompt: str,
+    model: str = PLANNER_TEXT_MODEL,
+    json_object: bool = False,
+) -> str:
     _set_key(api_key)
     if "qwen-max" in (model or "").lower():
         prompt = f"【System Prompt】{prompts.QWEN_MAX_PROMPT_SYSTEM_CONSTRAINT}\n\n{prompt}"
-    resp = Generation.call(model=model, prompt=prompt, api_key=api_key)
+
+    call_kwargs: dict[str, Any] = {
+        "model": model,
+        "api_key": api_key,
+    }
+    if json_object:
+        # 结构化提取：messages + json_object，利于 flash/turbo 稳定出 JSON
+        call_kwargs["messages"] = [{"role": "user", "content": prompt}]
+        call_kwargs["result_format"] = "message"
+        call_kwargs["response_format"] = {"type": "json_object"}
+    else:
+        call_kwargs["prompt"] = prompt
+
+    resp = Generation.call(**call_kwargs)
     if resp.status_code != 200:
         raise RuntimeError(getattr(resp, "message", None) or str(resp))
     out = resp.output
@@ -154,7 +616,8 @@ def _generation_text(*, api_key: str, prompt: str, model: str = PLANNER_TEXT_MOD
     if getattr(out, "text", None):
         return str(out.text).strip()
     if getattr(out, "choices", None) and out.choices:
-        c = out.choices[0].message.content
+        msg = out.choices[0].message
+        c = getattr(msg, "content", None) if msg is not None else None
         if isinstance(c, str):
             return c.strip()
     raise RuntimeError("无法解析规划模型输出")
@@ -202,11 +665,13 @@ def plan_background_prompts_for_slots(
     strategy: str = "background_v2",
     custom_template: str = "",
     user_requirements: str = "",
+    ref_image_paths: list[Path] | None = None,
 ) -> list[tuple[str, int, str]]:
     """
     为每张待生成图产出「背景」向 ref_prompt（主体仍以上传主图为依据，勿在文案中替换商品本体）。
 
     返回 [(kind, index, prompt), ...]，kind 为 'main' 或 'detail'，index 从 1 开始。
+    若提供 ref_image_paths，则用 VL（qwen-vl-plus）结合参考图规划；否则回退纯文本 qwen-max。
     """
     strategy_notes = {
         "background_v2": (
@@ -223,11 +688,48 @@ def plan_background_prompts_for_slots(
             "因此 MAIN 行强调多角度视角词与商品结构描述；DETAIL 行强调背景融合友好的环境/氛围词。"
         ),
         "doubao_seedream_5": (
-            "当前生成策略：即梦 doubao-seedream-5。\n"
-            "提示词强调中文可执行描述，关注构图、光影、场景与质感。"
+            "当前生成策略：豆包 Seedream 5.0 lite。\n"
+            "提示词强调中文可执行描述，关注构图、光影、场景与质感；保持商品主体一致。"
+        ),
+        "doubao_seedream_5_lite": (
+            "当前生成策略：豆包 Seedream 5.0 lite。\n"
+            "提示词强调中文可执行描述，关注构图、光影、场景与质感；保持商品主体一致。"
+        ),
+        "doubao_seedream_5_pro": (
+            "当前生成策略：豆包 Seedream 5.0 pro。\n"
+            "提示词可更精细（材质、光影、文字排版）；强调主体一致性与电商主图专业感。"
+        ),
+        "doubao_seedream_4_5": (
+            "当前生成策略：豆包 Seedream 4.5。\n"
+            "提示词强调细节与复杂场景可读性，保持商品主体一致。"
+        ),
+        "doubao_seedream_4_0": (
+            "当前生成策略：豆包 Seedream 4.0。\n"
+            "提示词简洁可执行，关注构图与光影，保持商品主体一致。"
+        ),
+        "qwen_image_2_0_pro": (
+            "当前生成策略：千问 qwen-image-2.0-pro（Pro 稳定版）。\n"
+            "强调文字渲染、真实质感与语义遵循；如有文字请写清内容与排版位置。"
+        ),
+        "qwen_image_2_0_pro_2026_06_22": (
+            "当前生成策略：千问 qwen-image-2.0-pro-2026-06-22（Pro 快照）。\n"
+            "与 Pro 同系，提示词同样强调文字、质感与主体一致。"
+        ),
+        "qwen_image_2_0": (
+            "当前生成策略：千问 qwen-image-2.0（加速版）。\n"
+            "兼顾效果与速度；提示词简洁可执行，保持商品主体一致。"
+        ),
+        "qwen_z_image_turbo": (
+            "当前生成策略：千问 z-image-turbo（速度与性价比）。\n"
+            "提示词偏写实人像/产品图，语句短而具体。"
+        ),
+        "qwen_wan27_image_pro": (
+            "当前生成策略：万相 wan2.7-image-pro。\n"
+            "可强调五官/色彩/超长文字与高分辨率场景；保持商品主体一致。"
         ),
     }.get(strategy, "当前生成策略：未知，按通用电商出图提示词规划。")
 
+    refs = [p for p in (ref_image_paths or []) if p.is_file()][:PLANNER_MAX_REF_IMAGES]
     prompt = prompts.build_plan_background_prompt(
         product_name=product_name,
         product_desc=product_desc,
@@ -237,10 +739,11 @@ def plan_background_prompts_for_slots(
         strategy_notes=strategy_notes,
         custom_template=custom_template,
         user_requirements=user_requirements,
+        ref_image_count=len(refs),
     )
     logger.info(
         "\n[PLAN_PROMPT_BEGIN]\n"
-        "strategy=%s n_main=%s n_detail=%s custom_template=%s\n"
+        "strategy=%s n_main=%s n_detail=%s custom_template=%s ref_images=%s model=%s\n"
         "product_name=%s\n"
         "%s\n"
         "[PLAN_PROMPT_END]",
@@ -248,10 +751,20 @@ def plan_background_prompts_for_slots(
         n_main,
         n_detail,
         bool((custom_template or "").strip()),
+        len(refs),
+        PLANNER_VL_MODEL if refs else PLANNER_TEXT_MODEL,
         product_name,
         prompt,
     )
-    raw = _generation_text(api_key=api_key, prompt=prompt, model=PLANNER_TEXT_MODEL)
+    if refs:
+        raw = multimodal_text(
+            api_key=api_key,
+            image_paths=refs,
+            user_prompt=prompt,
+            model=PLANNER_VL_MODEL,
+        )
+    else:
+        raw = _generation_text(api_key=api_key, prompt=prompt, model=PLANNER_TEXT_MODEL)
     parsed_json = _parse_slot_plan_json(raw, n_main, n_detail)
     if parsed_json is not None:
         return _normalize_slot_prompts_to_chinese(api_key=api_key, rows=parsed_json)
@@ -317,14 +830,27 @@ def plan_single_slot_prompt(
     index: int,
     strategy: str,
     old_prompt: str = "",
+    ref_image_paths: list[Path] | None = None,
+    primary_ref_index: int | None = None,
 ) -> str:
-    """重构单张提示词：结合基础描述与场景想象，返回单行可直接出图提示词。"""
+    """重构单张提示词：结合基础描述、参考图与场景想象，返回单行可直接出图提示词。"""
     slot_name = "主图" if kind == "main" else "详情图"
     slot_rule = (
         "主图请重点体现多角度展示与点击吸引力，尽量匹配对应序号策略（1首图、2场景细节、3营销功能、4信任包装、5白底标准）。"
         if kind == "main"
         else "详情图请重点结合基础描述，补充卖点叙事、场景想象与信息层次（海报/卖点/细节/参数/背书）。"
     )
+    refs = [p for p in (ref_image_paths or []) if p.is_file()][:PLANNER_MAX_REF_IMAGES]
+    primary_label = ""
+    if refs:
+        pi = 0
+        if primary_ref_index is not None and refs:
+            pi = int(primary_ref_index) % len(refs)
+            # 将主参考图放到列表首位，便于模型优先关注
+            if pi > 0:
+                refs = [refs[pi], *[r for i, r in enumerate(refs) if i != pi]]
+                pi = 0
+        primary_label = f"图{pi + 1}"
     prompt = prompts.build_plan_single_prompt(
         index=index,
         slot_name=slot_name,
@@ -334,8 +860,18 @@ def plan_single_slot_prompt(
         strategy=strategy,
         old_prompt=old_prompt,
         slot_rule=slot_rule,
+        ref_image_count=len(refs),
+        primary_ref_label=primary_label,
     )
-    out = _generation_text(api_key=api_key, prompt=prompt, model=PLANNER_TEXT_MODEL)
+    if refs:
+        out = multimodal_text(
+            api_key=api_key,
+            image_paths=refs,
+            user_prompt=prompt,
+            model=PLANNER_VL_MODEL,
+        )
+    else:
+        out = _generation_text(api_key=api_key, prompt=prompt, model=PLANNER_TEXT_MODEL)
     line = (out or "").strip().splitlines()[0].strip()
     line = line or (old_prompt.strip() if old_prompt.strip() else f"{product_name} 电商棚拍，背景简洁，光影干净，主体突出")
     return _normalize_prompt_len_zh(line)
@@ -670,6 +1206,157 @@ def text_to_image_first_url(
     return str(url)
 
 
+def _seedream_supports_sequential_image_generation(model_id: str) -> bool:
+    """组图参数仅部分 Seedream 支持（4.0 / 4.5 / 5.0 lite）；pro / 更早版本会 400。"""
+    mid = (model_id or "").lower()
+    if "seedream-5-0-pro" in mid or "seedream-5.0-pro" in mid:
+        return False
+    if "seedream-3" in mid:
+        return False
+    # 4.0 / 4.5 / 5.0 lite（非 pro）
+    if "seedream-4" in mid or "seedream-5-0" in mid or "seedream-5.0" in mid:
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# 各模型官方 size 能力（与 frontend/src/constants/modelImageSizes.ts 对齐）
+# ---------------------------------------------------------------------------
+
+_SizeChoice = tuple[str, int, int]  # aspect, width, height
+
+
+def _choices(*items: tuple[str, int, int]) -> list[_SizeChoice]:
+    return list(items)
+
+
+_SEEDREAM_5_LITE_2K = _choices(
+    ("1:1", 2048, 2048),
+    ("4:3", 2304, 1728),
+    ("3:4", 1728, 2304),
+    ("16:9", 2848, 1600),
+    ("9:16", 1600, 2848),
+    ("3:2", 2496, 1664),
+    ("2:3", 1664, 2496),
+    ("21:9", 3136, 1344),
+)
+_SEEDREAM_5_LITE_3K = _choices(
+    ("1:1", 3072, 3072),
+    ("4:3", 3456, 2592),
+    ("3:4", 2592, 3456),
+    ("16:9", 4096, 2304),
+    ("9:16", 2304, 4096),
+    ("3:2", 3744, 2496),
+    ("2:3", 2496, 3744),
+    ("21:9", 4704, 2016),
+)
+_SEEDREAM_4_5_2K = _choices(
+    ("1:1", 2048, 2048),
+    ("4:3", 2304, 1728),
+    ("3:4", 1728, 2304),
+    ("16:9", 2560, 1440),
+    ("9:16", 1440, 2560),
+    ("3:2", 2496, 1664),
+    ("2:3", 1664, 2496),
+    ("21:9", 3024, 1296),
+)
+_SEEDREAM_4_4K = _choices(
+    ("1:1", 4096, 4096),
+    ("4:3", 4694, 3520),
+    ("3:2", 4992, 3328),
+    ("16:9", 5404, 3040),
+    ("21:9", 6198, 2656),
+)
+_SEEDREAM_4_1K = _choices(("1:1", 1024, 1024))
+_SEEDREAM_4_2K = _choices(
+    ("1:1", 2048, 2048),
+    ("4:3", 2304, 1728),
+    ("3:2", 2496, 1664),
+    ("16:9", 2560, 1440),
+    ("21:9", 3024, 1296),
+)
+_QWEN_IMAGE_2_REC = _choices(
+    ("1:1", 2048, 2048),
+    ("16:9", 2688, 1536),
+    ("9:16", 1536, 2688),
+    ("4:3", 2368, 1728),
+    ("3:4", 1728, 2368),
+)
+
+# strategy -> (size_format, default_res, default_aspect, sizes_by_res)
+# size_format: "x" | "*"
+_STRATEGY_SIZE_PROFILES: dict[str, tuple[str, str, str, dict[str, list[_SizeChoice]]]] = {
+    "doubao_seedream_5": ("x", "2K", "1:1", {"2K": _SEEDREAM_5_LITE_2K, "3K": _SEEDREAM_5_LITE_3K}),
+    "doubao_seedream_5_lite": ("x", "2K", "1:1", {"2K": _SEEDREAM_5_LITE_2K, "3K": _SEEDREAM_5_LITE_3K}),
+    "doubao_seedream_5_pro": ("x", "2K", "1:1", {"1K": _SEEDREAM_4_1K, "2K": _SEEDREAM_4_2K}),
+    "doubao_seedream_4_5": ("x", "2K", "1:1", {"2K": _SEEDREAM_4_5_2K, "4K": _SEEDREAM_4_4K}),
+    "doubao_seedream_4_0": ("x", "2K", "1:1", {"1K": _SEEDREAM_4_1K, "2K": _SEEDREAM_4_2K, "4K": _SEEDREAM_4_4K}),
+    "qwen_image_2_0_pro": ("*", "rec", "1:1", {"rec": _QWEN_IMAGE_2_REC}),
+    "qwen_image_2_0_pro_2026_06_22": ("*", "rec", "1:1", {"rec": _QWEN_IMAGE_2_REC}),
+    "qwen_image_2_0": ("*", "rec", "1:1", {"rec": _QWEN_IMAGE_2_REC}),
+}
+
+
+def _profile_for_strategy(strategy: str) -> tuple[str, str, str, dict[str, list[_SizeChoice]]]:
+    return _STRATEGY_SIZE_PROFILES.get(
+        strategy,
+        _STRATEGY_SIZE_PROFILES["doubao_seedream_5_lite"],
+    )
+
+
+def resolve_pixel_wh(
+    strategy: str | None = None,
+    resolution: str | None = None,
+    aspect_ratio: str | None = None,
+) -> tuple[int, int]:
+    """按当前策略官方推荐表解析宽高；缺省回退到该策略默认项。"""
+    sep, default_res, default_aspect, by_res = _profile_for_strategy(strategy or "")
+    _ = sep
+    res = (resolution or default_res).strip() or default_res
+    aspect = (aspect_ratio or default_aspect).strip() or default_aspect
+    choices = by_res.get(res) or by_res.get(default_res) or []
+    for a, w, h in choices:
+        if a == aspect:
+            return w, h
+    # 详情常用竖图：若请求 9:16 但当前档无此比例，回退 2:3 / 3:4
+    if aspect in ("9:16", "2:3", "3:4"):
+        by_aspect = {a: (w, h) for a, w, h in choices}
+        for prefer in ("9:16", "2:3", "3:4"):
+            if prefer in by_aspect:
+                return by_aspect[prefer]
+    if choices:
+        return choices[0][1], choices[0][2]
+    return 2048, 2048
+
+
+def format_model_size(
+    *,
+    strategy: str | None = None,
+    resolution: str | None = None,
+    aspect_ratio: str | None = None,
+) -> str:
+    sep, _, _, _ = _profile_for_strategy(strategy or "")
+    w, h = resolve_pixel_wh(strategy, resolution, aspect_ratio)
+    return f"{w}{sep}{h}"
+
+
+def resolve_generation_size_for_strategy(
+    strategy: str,
+    *,
+    resolution: str | None = None,
+    aspect_ratio: str | None = None,
+) -> str:
+    """按策略返回可直接传给模型的官方 size。"""
+    if strategy in _STRATEGY_SIZE_PROFILES or is_doubao_strategy(strategy) or is_qwen_image_strategy(strategy):
+        return format_model_size(
+            strategy=strategy, resolution=resolution, aspect_ratio=aspect_ratio
+        )
+    # 文生图等其它策略：沿用千问推荐 1:1
+    return format_model_size(
+        strategy="qwen_image_2_0", resolution=resolution, aspect_ratio=aspect_ratio
+    )
+
+
 def doubao_seedream_generate_first_url(
     *,
     api_key: str,
@@ -677,21 +1364,25 @@ def doubao_seedream_generate_first_url(
     image: str | None = None,
     size: str = "2K",
     watermark: bool = True,
+    model: str | None = None,
 ) -> str:
-    """调用即梦（火山 ARK）REST API 生图，返回首图 URL。"""
+    """调用豆包 Seedream（火山 ARK）REST API 生图，返回首图 URL。"""
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {api_key}",
     }
+    use_model = model or DOUBAO_SEEDREAM_MODEL
     payload: dict[str, Any] = {
-        "model": DOUBAO_SEEDREAM_MODEL,
+        "model": use_model,
         "prompt": (prompt or "")[:2000],
-        "sequential_image_generation": "disabled",
         "response_format": "url",
         "size": size,
         "stream": False,
         "watermark": bool(watermark),
     }
+    # 仅部分模型支持；不支持时传参会 InvalidParameter
+    if _seedream_supports_sequential_image_generation(use_model):
+        payload["sequential_image_generation"] = "disabled"
     if image:
         payload["image"] = image
     r = requests.post(
@@ -701,16 +1392,150 @@ def doubao_seedream_generate_first_url(
         timeout=180,
     )
     if r.status_code != 200:
-        raise RuntimeError(f"即梦生图失败: HTTP {r.status_code} {r.text[:500]}")
+        raise RuntimeError(f"豆包生图失败: HTTP {r.status_code} {r.text[:500]}")
     j = r.json()
     data = j.get("data") or []
     if not data:
-        raise RuntimeError("即梦生图无结果")
+        raise RuntimeError("豆包生图无结果")
     first = data[0]
     url = first.get("url") if isinstance(first, dict) else None
     if not url:
-        raise RuntimeError(f"即梦生图结果缺少 url 字段: {first}")
+        raise RuntimeError(f"豆包生图结果缺少 url 字段: {first}")
     return str(url)
+
+
+def _extract_image_url_from_mmc_output(out: Any) -> str:
+    choices = getattr(out, "choices", None) or []
+    if not choices:
+        raise RuntimeError(f"千问生图无 choices: {out}")
+    choice0 = choices[0]
+    msg = getattr(choice0, "message", None)
+    content = getattr(msg, "content", None) if msg else None
+    if isinstance(content, list):
+        for item in content:
+            if isinstance(item, dict) and item.get("image"):
+                return str(item["image"])
+            if isinstance(item, dict) and item.get("url"):
+                return str(item["url"])
+    raise RuntimeError(f"千问生图结果缺少 image: {content}")
+
+
+def qwen_multimodal_image_first_url(
+    *,
+    api_key: str,
+    model: str,
+    prompt: str,
+    image_path: Path | None = None,
+    size: str = "2048*2048",
+) -> str:
+    """qwen-image / z-image 等：MultiModalConversation 同步生图。"""
+    _set_key(api_key)
+    content: list[dict[str, Any]] = []
+    if image_path is not None and image_path.is_file():
+        content.append({"image": _local_image_path_for_multimodal(image_path)})
+    content.append({"text": (prompt or "")[:2000]})
+    messages = [{"role": "user", "content": content}]
+    resp = MultiModalConversation.call(
+        api_key=api_key,
+        model=model,
+        messages=messages,
+        result_format="message",
+        stream=False,
+        watermark=False,
+        prompt_extend=True,
+        size=size,
+    )
+    if getattr(resp, "status_code", None) != 200:
+        raise RuntimeError(getattr(resp, "message", None) or str(resp))
+    return _extract_image_url_from_mmc_output(resp.output)
+
+
+def wan_image_generation_first_url(
+    *,
+    api_key: str,
+    model: str,
+    prompt: str,
+    image_path: Path | None = None,
+    size: str = "2K",
+) -> str:
+    """wan2.7-image-pro 等：ImageGeneration 异步任务生图。"""
+    _set_key(api_key)
+    content: list[dict[str, Any]] = []
+    if image_path is not None and image_path.is_file():
+        content.append({"image": _local_image_path_for_multimodal(image_path)})
+    content.append({"text": (prompt or "")[:2000]})
+    message = Message(role="user", content=content)
+    response = ImageGeneration.async_call(
+        model=model,
+        api_key=api_key,
+        messages=[message],
+        enable_sequential=False,
+        n=1,
+        size=size,
+        watermark=False,
+        thinking_mode=True,
+    )
+    if getattr(response, "status_code", None) != 200:
+        raise RuntimeError(getattr(response, "message", None) or str(response))
+    status = ImageGeneration.wait(task=response, api_key=api_key)
+    out = getattr(status, "output", None)
+    if out is None:
+        raise RuntimeError("万相生图无 output")
+    task_status = (getattr(out, "task_status", None) or "").upper()
+    if task_status not in ("SUCCEEDED", "SUCCESS"):
+        raise RuntimeError(
+            getattr(out, "message", None)
+            or getattr(status, "message", None)
+            or f"万相生图失败: {task_status}"
+        )
+    choices = getattr(out, "choices", None) or []
+    if not choices:
+        raise RuntimeError(f"万相生图无 choices: {out}")
+    msg = getattr(choices[0], "message", None)
+    content_out = getattr(msg, "content", None) if msg else None
+    if isinstance(content_out, list):
+        for item in content_out:
+            if isinstance(item, dict) and item.get("image"):
+                return str(item["image"])
+            if isinstance(item, dict) and item.get("url"):
+                return str(item["url"])
+    raise RuntimeError(f"万相生图结果缺少 image: {content_out}")
+
+
+def qwen_family_generate_first_url(
+    *,
+    api_key: str,
+    strategy: str,
+    prompt: str,
+    image_path: Path | None = None,
+    size: str | None = None,
+    resolution: str | None = None,
+    aspect_ratio: str | None = None,
+) -> str:
+    """按千问策略路由到对应文生图/图生图 API（见百炼 Qwen-Image 文档）。"""
+    model = resolve_qwen_image_model(strategy)
+    if size is None:
+        size = resolve_generation_size_for_strategy(
+            strategy, resolution=resolution, aspect_ratio=aspect_ratio
+        )
+    if model.startswith("wan"):
+        return wan_image_generation_first_url(
+            api_key=api_key,
+            model=model,
+            prompt=prompt,
+            image_path=image_path,
+            size=size,
+        )
+    # qwen-image-2.0 系列 / z-image：同步 MultiModalConversation
+    if not size:
+        size = "1024*1024" if model == "z-image-turbo" else "2048*2048"
+    return qwen_multimodal_image_first_url(
+        api_key=api_key,
+        model=model,
+        prompt=prompt,
+        image_path=image_path,
+        size=size,
+    )
 
 
 def local_image_to_data_url(path: Path) -> str:
@@ -849,36 +1674,13 @@ def enforce_file_size_jpg(path: Path, *, min_kb: int = 0, max_kb: int = 1024) ->
     path.write_bytes(best)
 
 
-def split_detail_image_if_needed(
-    src: Path,
-    dest_dir: Path,
-    *,
-    width: int = TAOBAO_DETAIL_RECOMMENDED_WIDTH,
-    max_height: int = TAOBAO_DETAIL_RECOMMENDED_MAX_HEIGHT,
-    base_name: str = "detail",
-) -> list[Path]:
-    """详情图宽度锁定，超过 max_height 自动切片。"""
+def export_image_as_jpg(src: Path, dest: Path, *, quality: int = 92) -> None:
+    """按原尺寸导出 JPG，不做缩放 / 裁切 / 切片。"""
     from PIL import Image
 
     im = Image.open(src).convert("RGB")
-    if im.width != width:
-        ratio = width / float(im.width)
-        target_h = max(1, int(im.height * ratio))
-        im = im.resize((width, target_h), Image.Resampling.LANCZOS)
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    out: list[Path] = []
-    y = 0
-    part = 1
-    while y < im.height:
-        h = min(max_height, im.height - y)
-        chunk = im.crop((0, y, width, y + h))
-        p = dest_dir / f"{base_name}_{part:02d}.jpg"
-        chunk.save(p, "JPEG", quality=90, optimize=True)
-        enforce_file_size_jpg(p, min_kb=0, max_kb=3072)
-        out.append(p)
-        y += h
-        part += 1
-    return out
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    im.save(dest, "JPEG", quality=quality, optimize=True)
 
 
 # 兼容旧引用（若仍有代码 import ImageSynthesis）

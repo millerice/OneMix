@@ -92,6 +92,18 @@ def build_translate_prompt(src: str) -> str:
 """
 
 
+def _ref_images_block(*, ref_image_count: int, primary_ref_label: str = "") -> str:
+    if ref_image_count <= 0:
+        return ""
+    labels = "、".join(f"图{i}" for i in range(1, ref_image_count + 1))
+    primary = f"；本槽主参考为 {primary_ref_label}" if primary_ref_label else ""
+    return f"""
+【参考白底商品图】（已按顺序附上：{labels}{primary}）
+请仔细观察参考图中的商品外形、颜色、材质、结构与视角；提示词必须与实物主体一致，禁止臆造与参考图明显不符的商品形态或颜色。
+识别并延续图片风格（构图、色调、光感、材质表现、氛围），再结合商品信息写可直接生图的提示词。
+"""
+
+
 def build_plan_background_prompt(
     *,
     product_name: str,
@@ -102,7 +114,9 @@ def build_plan_background_prompt(
     strategy_notes: str,
     custom_template: str = "",
     user_requirements: str = "",
+    ref_image_count: int = 0,
 ) -> str:
+    ref_block = _ref_images_block(ref_image_count=ref_image_count)
     if (custom_template or "").strip():
         output_hint = (
             "请严格输出你模板中定义的 JSON 对象；不要输出 Markdown、不要解释、不要追加其它段落。"
@@ -126,14 +140,14 @@ def build_plan_background_prompt(
 
 【当前策略约束】
 {strategy_notes}
-
+{ref_block}
 额外硬性输出要求（用于系统解析）：
 1) {output_hint}
 2) 方案数量必须与用户要求一致（主图 {n_main}，详情 {n_detail}）。
 3) 每个方案都必须包含可直接用于生成的 wanx正向提示词；如存在 wanx负面提示词也请填写。
 """
 
-    return f"""你是电商视觉总监，请基于以下信息生成槽位提示词。
+    return f"""你是电商视觉总监，请基于以下信息与参考图生成槽位提示词。
 
 【商品名称】
 {product_name}
@@ -146,7 +160,7 @@ def build_plan_background_prompt(
 
 【策略约束】
 {strategy_notes}
-
+{ref_block}
 输出要求：
 1) 不要输出解释、不要输出 Markdown。
 2) 严格输出 {n_main + n_detail} 行。
@@ -165,7 +179,13 @@ def build_plan_single_prompt(
     strategy: str,
     old_prompt: str,
     slot_rule: str,
+    ref_image_count: int = 0,
+    primary_ref_label: str = "",
 ) -> str:
+    ref_block = _ref_images_block(
+        ref_image_count=ref_image_count,
+        primary_ref_label=primary_ref_label,
+    )
     return f"""你是电商视觉总监。请重构第{index}张{slot_name}提示词。
 
 【商品名称】
@@ -182,13 +202,13 @@ def build_plan_single_prompt(
 
 【旧提示词】（可参考可重写）
 {old_prompt or "（无）"}
-
+{ref_block}
 要求：
 1) 中文为主，禁止整句英文；英文仅允许商品名、型号、必要参数词。
 2) 使用短语，不写长句，单行输出，不限制长度。
 3) 重点描述背景和光影，画面简洁突出主体。
 4) {slot_rule}
-5) 信息优先用商品基础描述；不足时参考同类目爆款常见视觉表达补全。
+5) 信息优先用商品基础描述与参考图；不足时参考同类目爆款常见视觉表达补全。
 6) 读取参考图片内容，识别并延续图片当前风格（如构图、色调、光感、材质表现、氛围），再结合商品信息生成可直接生图的提示词。
 7) 只输出一行提示词文本，不要任何前后缀。
 """
