@@ -43,7 +43,7 @@ OneMix Web 聚焦电商上新场景，帮助运营从商品资料中快速生成
 海报展示：
 
 <p>
-  <img src="./images/详情图5.png" alt="海报示例（生成商品图）" width="96%" />
+  <img src="./images/详情图5.jpg" alt="海报示例（生成商品图）" width="96%" />
 </p>
 
 主图展示：
