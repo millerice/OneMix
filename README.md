@@ -49,18 +49,19 @@ OneMix Web 聚焦电商上新场景，帮助运营从商品资料中快速生成
 主图展示：
 
 <p>
-  <img src="./images/主图1.jpg" alt="主图示例 1（生成商品图）" width="32%" />
-  <img src="./images/主图2.jpg" alt="主图示例 2（生成商品图）" width="32%" />
-  <img src="./images/主图3.jpg" alt="主图示例 3（生成商品图）" width="32%" />
+  <img src="./images/主图1.jpg" alt="主图示例 1（生成商品图）" width="24%" />
+  <img src="./images/主图2.jpg" alt="主图示例 2（生成商品图）" width="24%" />
+  <img src="./images/主图3.jpg" alt="主图示例 3（生成商品图）" width="24%" />
+  <img src="./images/主图4.jpg" alt="主图示例 4（生成商品图）" width="24%" />
 </p>
 
 详情图展示：
 
 <p>
   <img src="./images/详情图1.jpg" alt="详情图示例 1（生成商品图）" width="24%" />
-  <img src="./images/详情图2.jfif" alt="详情图示例 2（生成商品图）" width="24%" />
-  <img src="./images/详情图3.jfif" alt="详情图示例 3（生成商品图）" width="24%" />
-  <img src="./images/详情图4.jfif" alt="详情图示例 4（生成商品图）" width="24%" />
+  <img src="./images/详情图2.jpg" alt="详情图示例 2（生成商品图）" width="24%" />
+  <img src="./images/详情图3.jpg" alt="详情图示例 3（生成商品图）" width="24%" />
+  <img src="./images/详情图4.jpg" alt="详情图示例 4（生成商品图）" width="24%" />
 </p>
 
 ## 工作流示意
@@ -87,6 +88,7 @@ OneMix Web 聚焦电商上新场景，帮助运营从商品资料中快速生成
 ![选择详情图参考图](./images/6.通过生成的主图选择详情图的参考图.png)
 ![设置详情图为参考图](./images/7.可以将生成的详情图设置为参考图.png)
 ![一键生成详情图](./images/9.一键生成详情图.png)
+![预览详情图](./images/10.生成详情图-预览.png)
 
 ## 技术架构
 
