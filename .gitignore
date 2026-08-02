@@ -45,6 +45,9 @@ frontend/.vite/
 tmp/
 temp/
 
+# --- Node / Frontend（本地脚手架配置，不纳入版本库） ---
+frontend/components.json
+
 # --- OS / editor ---
 .DS_Store
 Thumbs.db
